@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+
+import re
+import sys
+import json
+import socketserver
+import time
+import queue
+import threading
+import picamera
+from fractions import Fraction
+
+comlock = threading.Lock()
+
+stoptimelapse = threading.Event()
+stoptimelapse.set()
+
+class Parser():
+	def process(self,item):
+		print(self.source,"doing:",item)
+
+		try:
+			parsed=item.split("=")
+			if len(parsed)==1 or hasattr(MyPiCamera, parsed[0]) and callable(getattr(MyPiCamera, parsed[0])):				# No assignments in this so commands instead
+				command = parsed[0]
+				print(self.source,"command",command)
+				return getattr(camera,parsed[0])()
+			else:
+				attribute=parsed[0]
+				value=parsed[1]
+				currentvalue = getattr(camera,attribute)
+				print(self.source,"attribute:",attribute,"value:",value,"previous:",currentvalue)
+				try:										# try Integer
+					setattr(camera,attribute,int(value))
+					print(self.source,"processed",attribute,"as Integer")
+				except ValueError:
+					try:									# try Boolean
+						setattr(camera,attribute,to_bool(value))
+						print(self.source,"processed",attribute,"as Boolean")
+					except ValueError:
+						try:								# try String
+							setattr(camera,attribute,value)
+							print(self.source,"processed",attribute,"as String")
+						except:
+							try:										# try a tuple of Integers
+								values=value.split(',')
+								values=[int(i) for i in values]
+								setattr(camera,attribute,tuple(values))
+								print(self.source,"processed",attribute,"as Tuple of integers")
+							except (ValueError,TypeError):
+								try:									# try a tuple of Floats
+									values=value.split(',')
+									values=[float(i) for i in values]
+									setattr(camera,attribute,tuple(values))
+									print(self.source,"processed",attribute,"as Tuple of floats")
+								except (ValueError,TypeError):						# try a tuple of Strings
+									try:
+										values=value.split(',')
+										setattr(camera,attribute,tuple(values))
+										print(self.source,"processed",attribute,"as Tuple of strings")
+									except (ValueError,TypeError):					# try a tuple of Fractions
+										values=value.split(',')
+										values=[Fraction(i) for i in values]
+										setattr(camera,attribute,tuple(values))
+										print(self.source,"processed",attribute,"as Tuple of fractions")
+				print(self.source,attribute,"now:",getattr(camera,attribute))
+				return attribute+" now "+str(getattr(camera,attribute))+"\nOK\n"
+		except:
+			print(self.source,"Error:",sys.exc_info()[0],sys.exc_info()[1])
+			return "Error:"+str(sys.exc_info()[0])+" "+str(sys.exc_info()[1])+"\nERROR\n"
+
+
+class MyTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+	"""Simple TCP multi-threaded server with a queue for messaging"""
+	daemon_threads = True
+# much faster rebinding
+	allow_reuse_address = True
+
+class MyTCPHandler(socketserver.StreamRequestHandler, Parser):
+	def handle(self):
+		try:
+			self.source = "{0}({1})".format(self.client_address[0],self.client_address[1])
+			print(self.source,"connected")
+			inputline = self.rfile.readline()
+			while inputline:
+				inputline = inputline.strip()
+				print(self.source,"input:",inputline.decode("utf-8"))
+
+				# Use a lock to ensure only one connection is having a command processed at a time
+				comlock.acquire()
+				response=self.process(inputline.decode("utf-8"))
+				if response:
+					self.wfile.write(response.encode("utf-8"))
+				comlock.release()
+
+				inputline = self.rfile.readline()
+			print(self.source,"disconnected")
+		finally:
+			# Ensure that the lock has been released
+			try:
+				comlock.release()
+			except threading.ThreadError:
+				pass
+
+def startserver():
+	HOST, PORT = "", 9999
+	server = MyTCPServer((HOST, PORT), MyTCPHandler)
+	server.serve_forever()
+
+class MyPiCamera(picamera.PiCamera):
+	def __init__(self):
+		super().__init__()
+		self.bitrate=10000000						# Bitrate of recordings
+		self.videoquality=0						# Quality for video capture
+		self.usevideoport=False						# Quality for video capture
+#		self.timelapsefile='image-{counter:02d}.jpg'			# Generator for timelapse filenames
+		self.timelapseprefix='image'					# Prefix to generator for timelapse filename
+		self.timelapsefile='-{timestamp:%Y-%m-%d_%H-%M-%S.%f}.jpg'	# Generator for timelapse filenames
+
+		self.timelapsedir='timelapses'					# Directory for timelapse photographs
+		self._interval=1						# Timelapse interval in ms
+		self._imagequality=0						# Quality for image capture
+		self._capturedir='images'					# Directory for captured photographs
+		self._videodir='videos'						# Directory for videos
+		self._presetdir='presets'					# Directory for presets
+		self._lastpreset="None"						# Most recently loaded preset
+		self._lastsavepreset="None"					# Last saved preset
+		self._lastcapture="None"					# Most recently captured picture
+		self._lastrecord="None"						# Most recently recorded video
+		self._quickzoom=0						# Fast zooming
+
+	@property
+	def interval(self):
+		return self._interval
+	@interval.setter
+	def interval(self,x):
+		if isinstance(x,int):
+			self._interval=x
+		else:
+			raise TypeError('Requires an integer')
+
+	@property
+	def imagequality(self):
+		return self._imagequality
+	@imagequality.setter
+	def imagequality(self,x):
+		if isinstance(x,int):
+			self._imagequality=x
+		else:
+			raise TypeError('Requires an integer')
+
+	@property
+	def load_preset(self):
+		return self._lastpreset
+	@load_preset.setter
+	def load_preset(self,filename):
+		response=""
+		fullname=camera._presetdir+"/"+filename
+		print(filename,"loading preset:",fullname)
+		p=Parser()
+		p.source=filename
+		with open(fullname,'r') as f:
+			for line in f:
+				response=response+p.process(line.rstrip())
+		f.closed
+		print(filename,"loaded")
+		self._lastpreset=fullname
+		return response
+
+	@property
+	def save_preset(self):
+		return self._lastsavepreset
+	@save_preset.setter
+	def save_preset(self,filename):
+		fullname=camera._presetdir+"/"+filename
+		print(filename,"saving preset:",fullname)
+		f=open(fullname,'w')
+		f.write("resolution="				+ ",".join(map(str,camera.resolution)) +"\n")
+		f.write("framerate="				+ str(camera.framerate) + "\n")
+		f.write("hflip="				+ str(camera.hflip) + "\n")
+		f.write("vflip="				+ str(camera.vflip) + "\n")
+		f.write("rotation="				+ str(camera.rotation) + "\n")
+		f.write("zoom="					+ ",".join(map(str,camera.zoom)) + "\n")
+
+		f.write("shutter_speed="			+ str(camera.shutter_speed) + "\n")
+		f.write("iso="					+ str(camera.iso) + "\n")
+		f.write("exposure_mode=" 			+ str(camera.exposure_mode) + "\n")
+		f.write("exposure_compensation="		+ str(camera.exposure_compensation) + "\n")
+		f.write("awb_mode="				+ str(camera.awb_mode) + "\n")
+		f.write("awb_gains="				+ ",".join(map(str,camera.awb_gains)) + "\n")
+		f.write("meter_mode="				+ camera.meter_mode + "\n")
+
+		f.write("brightness="				+ str(camera.brightness) + "\n")
+		f.write("contrast="				+ str(camera.contrast) + "\n")
+		f.write("saturation="				+ str(camera.saturation) + "\n")
+		f.write("sharpness="				+ str(camera.sharpness) + "\n")
+		f.write("drc_strength="				+ str(camera.drc_strength) + "\n")
+
+		f.write("image_denoise="			+ str(camera.image_denoise) + "\n")
+		f.write("image_effect="				+ str(camera.image_effect) + "\n")
+		f.write("video_denoise="			+ str(camera.video_denoise) + "\n")
+		f.write("video_stabilization="			+ str(camera.video_stabilization) + "\n")
+		f.close()
+		print(filename,"saved")
+		self._lastsavepreset=fullname
+
+	@property
+	def capture(self):
+		return self._lastcapture
+	@capture.setter
+	def capture(self,filename):
+		suffixes = re.compile('\.(jpg|png|bmp|gif|yuv|rbg|rgba|bgr|bgra)$')
+
+		if isinstance(filename, str) and suffixes.search(filename):
+			fullname=self._capturedir+"/"+filename
+			if self.resolution == (2592,1944) and not self.recording:
+				super().capture(fullname)
+			else:
+				super().capture(fullname,use_video_port=True)
+			self._lastcapture=fullname
+			return
+		else:
+			raise ValueError('Invalid file type')
+
+	@property
+	def record(self):
+		return self._lastrecord
+	@record.setter
+	def record(self,filename):
+		fullname=self._videodir+"/"+filename
+		print(filename,"recording video to:",fullname)
+		camera.start_recording(fullname,bitrate=self.bitrate,quality=self.videoquality)
+		print(filename,"recording started")
+		self._lastrecord = fullname
+
+	def help(self):
+		response="\nCommands\n--------"
+		response=response+"\n"+"capture=filename.jpg"
+		response=response+"\n"+"record=filename.h264"
+		response=response+"\n"+"stop_record"
+		response=response+"\n"+"start_timelapse"
+		response=response+"\n"+"stop_timelapse"
+
+		response=response+"\n\n"+"qz=[0-9]"
+		response=response+"\n"+"status"
+		response=response+"\n"+"help"
+
+		response=response+"\n\n"+"resolution="		+ ",".join(map(str,camera.resolution))
+		response=response+"\n"+"framerate="		+ str(camera.framerate)
+		response=response+"\n"+"hflip="			+ str(camera.hflip)
+		response=response+"\n"+"vflip="			+ str(camera.vflip)
+		response=response+"\n"+"rotation="		+ str(camera.rotation)
+		response=response+"\n"+"zoom="			+ ",".join(map(str,camera.zoom))
+
+		response=response+"\n\n"+"shutter_speed="	+ str(camera.shutter_speed)
+		response=response+"\n"+"exposure_speed="	+ str(camera.exposure_speed)
+		response=response+"\n"+"iso="			+ str(camera.iso)
+		response=response+"\n"+"exposure_mode="		+ str(camera.exposure_mode)
+		response=response+"\n"+"exposure_compensation="	+ str(camera.exposure_compensation)
+		response=response+"\n"+"awb_mode="		+ str(camera.awb_mode)
+		response=response+"\n"+"awb_gains="		+ ",".join(map(str,camera.awb_gains))
+		response=response+"\n"+"meter_mode="		+ camera.meter_mode
+		response=response+"\n"+"analog_gain="		+ str(camera.analog_gain)
+		response=response+"\n"+"digital_gain="		+ str(camera.digital_gain)
+
+		response=response+"\n\n"+"brightness="		+ str(camera.brightness)
+		response=response+"\n"+"contrast="		+ str(camera.contrast)
+		response=response+"\n"+"saturation="		+ str(camera.saturation)
+		response=response+"\n"+"sharpness="		+ str(camera.sharpness)
+		response=response+"\n"+"drc_strength="		+ str(camera.drc_strength)
+
+		response=response+"\n\n"+"image_denoise="	+ str(camera.image_denoise)
+		response=response+"\n"+"image_effect="		+ str(camera.image_effect)
+		response=response+"\n"+"video_denoise="		+ str(camera.video_denoise)
+		response=response+"\n"+"video_stabilization="	+ str(camera.video_stabilization)
+
+		return response+"\nOK\n"
+
+	def stop_record(self):
+		camera.stop_recording()
+		print("Recording stop")
+		return "OK\n"
+
+	def status(self):
+		response="\n"
+		response=response+"resolution:            "	+ ",".join(map(str,camera.resolution))+"\n"
+		response=response+"framerate:             "	+ str(camera.framerate)+"\n"
+		response=response+"hflip:                 "	+ str(camera.hflip)+"\n"
+		response=response+"vflip:                 "	+ str(camera.vflip)+"\n"
+		response=response+"rotation:              "	+ str(camera.rotation)+"\n"
+		response=response+"zoom:                  "	+ ",".join(map(str,camera.zoom))+"\n"+"\n"
+
+		response=response+"shutter_speed:         "	+ str(camera.shutter_speed)+"\n"
+		response=response+"exposure_speed:        "	+ str(camera.exposure_speed)+"\n"
+		response=response+"iso:                   "	+ str(camera.iso)+"\n"
+		response=response+"exposure_mode:         " + str(camera.exposure_mode)+"\n"
+		response=response+"exposure_compensation: "	+ str(camera.exposure_compensation)+"\n"
+		response=response+"awb_mode:              "	+ str(camera.awb_mode)+"\n"
+		response=response+"awb_gains:             "	+ ",".join(map(str,camera.awb_gains))+"\n"
+		response=response+"meter_mode:            "	+ camera.meter_mode+"\n"
+		response=response+"analog_gain:           "	+ str(camera.analog_gain)+"\n"
+		response=response+"digital_gain:          "	+ str(camera.digital_gain)+"\n"
+
+		response=response+"brightness:            "	+ str(camera.brightness)+"\n"
+		response=response+"contrast:              "	+ str(camera.contrast)+"\n"
+		response=response+"saturation:            "	+ str(camera.saturation)+"\n"
+		response=response+"sharpness:             "	+ str(camera.sharpness)+"\n"
+		response=response+"drc_strength:          "	+ str(camera.drc_strength)+"\n"
+
+		response=response+"image_denoise:         "	+ str(camera.image_denoise)+"\n"
+		response=response+"image_effect:          "	+ str(camera.image_effect)+"\n"
+		response=response+"video_denoise:         "	+ str(camera.video_denoise)+"\n"
+		response=response+"video_stabilization:   "	+ str(camera.video_stabilization)+"\n"
+		response=response+"OK\n"
+		return response
+
+	def start_timelapse(self):
+		if stoptimelapse.is_set():
+			stoptimelapse.clear()
+			timelapsethread = threading.Thread(target=timelapse, args=(self._interval,))
+			timelapsethread.daemon = True
+			timelapsethread.start()
+			print("Timelapse started")
+			return "Timelapse started\nOK\n"
+		else:
+			print('Timelapse already running')
+			return "Timelapse already running\nERROR\n"
+
+	def stop_timelapse(self):
+		if not stoptimelapse.is_set():
+			print("Timelapse stopping")
+			stoptimelapse.set()
+			return "Timelapse stopping\nOK\n"
+		else:
+			print('Timelapse not running')
+			return "Timelapse not running\nERROR\n"
+
+	@property
+	def qz(self):
+		return self._quickzoom
+
+	@qz.setter
+	def qz(self,val):
+		# May need to check hflip, vflip, and rotation
+		val=int(val)
+		amount=.6
+		x,y,w,h=camera.zoom
+		wnew=w*amount
+		hnew=h*amount
+		if   val==2 or val==5 or val==8:
+			xnew=x+(w-wnew)/2
+		elif val==3 or val==6 or val==9:
+			xnew=x+(w-wnew)
+		else:
+			xnew=x
+		if   val==4 or val==5 or val==6:
+			ynew=y+(h-hnew)/2
+		elif val==1 or val==2 or val==3:
+			ynew=y+(h-hnew)
+		else:
+			ynew=y
+		if val==0:
+			xnew=0
+			ynew=0
+			wnew=1
+			hnew=1
+		print("Ready to zoom",xnew,ynew,wnew,hnew)
+		camera.zoom=xnew,ynew,wnew,hnew
+		self._quickzoom=val
+		return "Zoom: "+str(xnew)+","+str(ynew)+","+str(wnew)+","+str(hnew)+"\nOK\n"
+
+def timelapse(interval):
+	try:
+		print('Starting timelapse - interval:',interval)
+		tick = time.time()
+		if camera.resolution == (2592,1944) and not camera.recording:
+			usevideoport=False
+		else:
+			usevideoport=True
+
+		for i, filename in enumerate(camera.capture_continuous(camera.timelapsedir+'/'+camera.timelapseprefix+camera.timelapsefile,use_video_port=usevideoport)):
+			pause = tick-time.time()+float(interval)
+			if pause < 0:
+				pause=0
+			timeout = stoptimelapse.wait(pause)
+			if timeout:
+				break
+			tick = time.time()
+	except:
+		stoptimelapse.set()
+		print("Timelapse Error:",sys.exc_info()[0],sys.exc_info()[1])
+		print("Timelapse stopped")
+
+def capture2(commandq):
+	while True:
+		command = commandq.get()
+		print("Processing command: ",command)
+		commands = command.split(" ")
+		try:
+			if commands[0]=="capture":
+				if camera.resolution == (2592,1944) and not camera.recording:
+					camera.capture(camera.capturedir+"/"+commands[1])
+				else:
+					camera.capture(camera.capturedir+"/"+commands[1],use_video_port=True)
+
+			elif commands[0]=="timelapse":
+				print("Timelapse")
+				if stoptimelapse.is_set():
+					stoptimelapse.clear()
+					timelapsethread = threading.Thread(target=timelapse, args=(commands[1],))
+					timelapsethread.daemon = True
+					timelapsethread.start()
+					print("Here")
+					time.sleep(10)
+				else:
+					print('Timelapse already running')
+			elif commands[0]=="stop_timelapse":
+				print("Stop timelapse")
+				stoptimelapse.set()
+
+			elif commands[0]=="record":
+				print("Starting to record "+camera.videodir+"/"+commands[1])
+				camera.start_recording(commands[1],bitrate=camera.bitrate,quality=camera.videoquality)
+#				camera.start_recording(camera.videodir+"/"+commands[1],bitrate=camera.bitrate,quality=camera.quality)
+				print("Recording started")
+			elif commands[0]=="stop_record":
+				camera.stop_recording()
+				print("Recording stop")
+
+			elif commands[0].isdigit() and len(commands[0])==1:
+				quickzoom(commands[0])
+				print("Quick Zoom")
+			else:
+				print("Unknown command: "+command)
+		except:
+			print("Unable to process command: "+command)
+			print("Error:", sys.exc_info()[0])
+		commandq.task_done()
+
+
+#####
+def to_bool(value):
+	valid = {'true': True, 't': True, '1': True,
+			 'false': False, 'f': False, '0': False,
+			}
+	if isinstance(value, bool):
+		return value
+
+	if not isinstance(value, str):
+		raise ValueError('invalid literal for boolean. Not a string.')
+
+	lower_value = value.lower()
+	if lower_value in valid:
+		return valid[lower_value]
+	else:
+		raise ValueError('invalid literal for boolean: "%s"' % value)
+
+
+commandq = queue.Queue(maxsize=0)
+timelapseq = queue.Queue(maxsize=0)
+sleeptime = 5
+
+with MyPiCamera() as camera:
+	try:
+		camera.start_preview()
+		startserver()
+	except:
+		print("Error:", sys.exc_info()[0])
+		print("Error:", sys.exc_info()[1])

@@ -1,0 +1,6 @@
+resolution=1280,720
+framerate=30
+hflip=True
+vflip=True
+rotation=0
+zoom=0.0,0.0,1.0,1.0

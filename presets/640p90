@@ -1,0 +1,6 @@
+resolution=640,480
+framerate=90
+hflip=True
+vflip=True
+rotation=0
+zoom=0.0,0.0,1.0,1.0
